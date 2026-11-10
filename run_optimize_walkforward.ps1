@@ -69,7 +69,7 @@ function Test-PythonDependencies {
     )
 
     try {
-        & $Exe -c "import numpy, pandas, sklearn, onnx, skl2onnx, onnxruntime" *>$null
+        & $Exe -c "import numpy, pandas, sklearn, yaml, onnx, skl2onnx, onnxruntime" *>$null
         return ($LASTEXITCODE -eq 0)
     }
     catch {
@@ -135,6 +135,9 @@ if (-not (Test-PythonDependencies -Exe $PythonExe)) {
     }
 }
 
+if ($PSBoundParameters.ContainsKey("InputFile") -and -not (Test-Path -LiteralPath $InputFile -PathType Leaf)) {
+    throw "Arquivo de entrada informado nao encontrado: $InputFile"
+}
 $resolvedInput = Resolve-InputFilePath -RequestedPath $InputFile
 if (-not $resolvedInput) {
     throw "Arquivo de entrada nao encontrado: $InputFile"
@@ -143,7 +146,6 @@ if (-not $resolvedInput) {
 $arguments = @(
     "src\sweep_market_regime.py",
     "--input", $resolvedInput,
-    "--config", $ConfigFile,
     "--output", $OutputFile,
     "--evaluation-mode", "walkforward",
     "--search-mode", $SearchMode,
@@ -244,7 +246,13 @@ else {
     Write-Host "Cap de folds por experimento: desabilitado"
 }
 
+if ($PSBoundParameters.ContainsKey("ConfigFile") -or (Test-Path -LiteralPath $ConfigFile -PathType Leaf)) {
+    $arguments += @("--config", $ConfigFile)
+}
 & $PythonExe @arguments
+if ($LASTEXITCODE -ne 0) {
+    throw "O processo Python terminou com codigo $LASTEXITCODE"
+}
 
 $outputPath = Join-Path $projectRoot $OutputFile
 $baseName = [System.IO.Path]::GetFileNameWithoutExtension($outputPath)

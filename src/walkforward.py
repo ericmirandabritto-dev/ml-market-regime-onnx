@@ -19,9 +19,8 @@ from market_regime_core import (
     ensure_dir,
     evaluate_model,
     export_market_runtime_contract,
-    export_onnx_model,
+    export_regime_onnx,
     save_json,
-    validate_onnx_model,
     validate_train_classes,
 )
 
@@ -87,20 +86,30 @@ def resolve_purge_bars(cfg: Dict, raw_value: str | int | None) -> int:
     if raw_value is None:
         raw_value = cfg.get("walkforward", {}).get("purge_bars", "auto")
 
+    horizon = int(cfg["label"]["horizon_bars"])
     if isinstance(raw_value, str) and raw_value.strip().lower() == "auto":
-        return int(cfg["label"]["horizon_bars"])
+        return horizon
 
-    return max(0, int(raw_value))
+    purge_bars = int(raw_value)
+    if purge_bars < horizon:
+        raise ValueError(f"walkforward.purge_bars deve ser pelo menos {horizon} (horizonte do rotulo)")
+    return purge_bars
 
 
-def cfg_hash(cfg: Dict, policy: WalkForwardPolicy) -> str:
+def cfg_hash(cfg: Dict, policy: WalkForwardPolicy, export_options: Dict) -> str:
     payload = {
         "config": cfg,
         "policy": asdict(policy),
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "export_options": export_options,
     }
     raw = json.dumps(payload, sort_keys=True).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _dataset_hash(dataset: pd.DataFrame) -> str:
+    rows = pd.util.hash_pandas_object(dataset, index=True)
+    return hashlib.sha256(rows.to_numpy(dtype="<u8").tobytes()).hexdigest()
 
 
 def format_mql_time(timestamp: pd.Timestamp) -> str:
@@ -132,6 +141,8 @@ def build_fold_definition(policy: WalkForwardPolicy, fold_number: int) -> FoldDe
 
 
 def _validate_walkforward_policy(policy: WalkForwardPolicy) -> None:
+    if policy.purge_bars < 0:
+        raise ValueError("walkforward.purge_bars nao pode ser negativo")
     if policy.train_window <= 0:
         raise ValueError("walkforward.train_window deve ser maior que zero")
     if policy.validation_window < 0:
@@ -329,8 +340,9 @@ def _can_reuse_exported_fold(
     fold_dir: Path,
     fold_record: Dict,
     configuration_hash: str,
+    data_hash: str,
 ) -> bool:
-    if not (fold_dir / "model.onnx").exists():
+    if not (fold_dir / "model.onnx").is_file():
         return False
     if not (fold_dir / "model_metadata.json").exists():
         return False
@@ -341,7 +353,7 @@ def _can_reuse_exported_fold(
     if not fold_info:
         return False
 
-    if fold_info.get("config_hash") != configuration_hash:
+    if fold_info.get("config_hash") != configuration_hash or fold_info.get("data_hash") != data_hash:
         return False
     if int(fold_info.get("feature_schema_version", -1)) != FEATURE_SCHEMA_VERSION:
         return False
@@ -498,17 +510,20 @@ def _can_reuse_runtime_fold_export(
     fold_dir: Path,
     fold_record: Dict,
     configuration_hash: str,
+    data_hash: str,
 ) -> bool:
-    if not (fold_dir / "model.onnx").exists():
+    if not (fold_dir / "model.onnx").is_file():
         return False
-    if not (fold_dir / "model_metadata.json").exists():
+    if not (fold_dir / "model_metadata.json").is_file():
+        return False
+    if not (fold_dir / "runtime_contract.csv").is_file():
         return False
 
     fold_info = _load_json(fold_dir / "fold_info.json")
     if not fold_info:
         return False
 
-    if fold_info.get("config_hash") != configuration_hash:
+    if fold_info.get("config_hash") != configuration_hash or fold_info.get("data_hash") != data_hash:
         return False
     if int(fold_info.get("feature_schema_version", -1)) != FEATURE_SCHEMA_VERSION:
         return False
@@ -550,11 +565,12 @@ def _can_reuse_live_tail(
     train_start: str | None,
     trained_until: str | None,
     rows_train: int,
+    data_hash: str,
 ) -> bool:
     if not existing_live_info:
         return False
 
-    if existing_live_info.get("config_hash") != configuration_hash:
+    if existing_live_info.get("config_hash") != configuration_hash or existing_live_info.get("data_hash") != data_hash:
         return False
     if int(existing_live_info.get("feature_schema_version", -1)) != FEATURE_SCHEMA_VERSION:
         return False
@@ -570,6 +586,18 @@ def _can_reuse_live_tail(
         and (export_dir / "live" / "model_metadata.json").exists()
         and (export_dir / "live" / "runtime_contract.csv").exists()
     )
+
+
+def _training_validation_sample(
+    train_df: pd.DataFrame, history_rows: int, cfg: Dict, validate_onnx: bool
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    if not validate_onnx:
+        return None, None
+    validation_rows = int(cfg["export"].get("validate_rows", 32))
+    if validation_rows < 1:
+        raise ValueError("export.validate_rows deve ser maior que zero")
+    sample_start = max(history_rows, len(train_df) - validation_rows)
+    return train_df.iloc[sample_start:], _history_slice(train_df, sample_start, history_rows)
 
 
 def export_live_tail_model(
@@ -615,6 +643,7 @@ def export_live_tail_model(
     live_dir = export_dir / "live"
     ensure_dir(live_dir)
 
+    data_hash = _dataset_hash(train_df)
     existing_live_info = _load_existing_live_tail_info(export_dir)
     if incremental_export and _can_reuse_live_tail(
         existing_live_info=existing_live_info,
@@ -623,6 +652,7 @@ def export_live_tail_model(
         train_start=result["train_start"],
         trained_until=result["trained_until"],
         rows_train=result["rows_train"],
+        data_hash=data_hash,
     ):
         result["available"] = True
         result["reused"] = True
@@ -649,11 +679,14 @@ def export_live_tail_model(
     model = build_model_backend(cfg)
     model.fit(train_df, feature_columns)
 
-    onnx_contract = export_onnx_model(
+    sample_df, sample_history_df = _training_validation_sample(train_df, model.history_rows_needed, cfg, validate_onnx)
+    onnx_contract, validation_payload = export_regime_onnx(
         model=model,
-        feature_count=len(feature_columns),
         output_path=live_dir / "model.onnx",
         opset=int(cfg["export"]["onnx_opset"]),
+        feature_columns=feature_columns,
+        sample_df=sample_df,
+        history_df=sample_history_df,
     )
     export_market_runtime_contract(
         destination=live_dir / "runtime_contract.csv",
@@ -661,24 +694,6 @@ def export_live_tail_model(
         feature_columns=feature_columns,
         onnx_contract=onnx_contract,
     )
-
-    validation_rows = int(cfg["export"].get("validate_rows", 32))
-    validation_payload = {"status": "disabled"}
-    if validate_onnx:
-        sample_df = train_df.iloc[-validation_rows:].copy()
-        sample_start = max(0, len(train_df) - len(sample_df))
-        sample_history_df = (
-            train_df.iloc[max(0, sample_start - model.history_rows_needed) : sample_start].copy()
-            if model.history_rows_needed > 0
-            else None
-        )
-        validation_payload = validate_onnx_model(
-            model=model,
-            onnx_path=live_dir / "model.onnx",
-            sample_df=sample_df,
-            feature_columns=feature_columns,
-            history_df=sample_history_df,
-        )
 
     live_tail_info = {
         "mode": "live_tail",
@@ -690,6 +705,7 @@ def export_live_tail_model(
         "rows_train": result["rows_train"],
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "config_hash": configuration_hash,
+        "data_hash": data_hash,
         "runtime_model_path": result["runtime_model_path"],
         "runtime_metadata_path": result["runtime_metadata_path"],
         "runtime_contract_path": result["runtime_contract_path"],
@@ -784,7 +800,8 @@ def export_runtime_fold_model(
 
     validation_payload = {"status": "disabled"}
     existing_metadata = None
-    reused = incremental_export and _can_reuse_runtime_fold_export(fold_dir, fold_record, configuration_hash)
+    data_hash = _dataset_hash(train_df)
+    reused = incremental_export and _can_reuse_runtime_fold_export(fold_dir, fold_record, configuration_hash, data_hash)
     if reused:
         existing_metadata = _load_json(fold_dir / "model_metadata.json") or {}
         validation_payload = existing_metadata.get("onnx_validation", validation_payload)
@@ -795,11 +812,16 @@ def export_runtime_fold_model(
         model = build_model_backend(cfg)
         model.fit(train_df, feature_columns)
 
-        onnx_contract = export_onnx_model(
+        sample_df, sample_history_df = _training_validation_sample(
+            train_df, model.history_rows_needed, cfg, validate_onnx
+        )
+        onnx_contract, validation_payload = export_regime_onnx(
             model=model,
-            feature_count=len(feature_columns),
             output_path=fold_dir / "model.onnx",
             opset=int(cfg["export"]["onnx_opset"]),
+            feature_columns=feature_columns,
+            sample_df=sample_df,
+            history_df=sample_history_df,
         )
         export_market_runtime_contract(
             destination=fold_dir / "runtime_contract.csv",
@@ -810,23 +832,6 @@ def export_runtime_fold_model(
         input_name = onnx_contract["input_name"]
         output_names = onnx_contract["output_names"]
         metadata_feature_columns = list(feature_columns)
-
-        validation_rows = int(cfg["export"].get("validate_rows", 32))
-        if validate_onnx:
-            sample_df = train_df.iloc[-validation_rows:].copy()
-            sample_start = max(0, len(train_df) - len(sample_df))
-            sample_history_df = (
-                train_df.iloc[max(0, sample_start - model.history_rows_needed) : sample_start].copy()
-                if model.history_rows_needed > 0
-                else None
-            )
-            validation_payload = validate_onnx_model(
-                model=model,
-                onnx_path=fold_dir / "model.onnx",
-                sample_df=sample_df,
-                feature_columns=feature_columns,
-                history_df=sample_history_df,
-            )
 
     fold_info = {
         "fold_id": fold.fold_id,
@@ -847,6 +852,7 @@ def export_runtime_fold_model(
         "purge_bars": int(policy.purge_bars),
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "config_hash": configuration_hash,
+        "data_hash": data_hash,
         "runtime_model_path": runtime_model_path,
         "runtime_metadata_path": runtime_metadata_path,
         "runtime_contract_path": runtime_contract_path,
@@ -988,13 +994,24 @@ def evaluate_walkforward(
     fold_progress_every: int = 1,
     incremental_export: bool = False,
 ) -> Dict:
+    resolve_purge_bars(cfg, policy.purge_bars)
     available_folds = generate_walkforward_folds(dataset, policy, apply_cap=False)
     folds = generate_walkforward_folds(dataset, policy, apply_cap=True)
     runtime_ready_folds = generate_train_ready_folds(dataset, policy)
     summary_records: List[Dict] = []
     oos_predictions: List[pd.DataFrame] = []
     research_manifest_records: List[Dict] = []
-    configuration_hash = cfg_hash(cfg, policy)
+    configuration_hash = cfg_hash(
+        cfg,
+        policy,
+        {
+            "validate_onnx": validate_onnx,
+            "runtime_root": runtime_root,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "input_csv": input_csv,
+        },
+    )
     walkforward_start = time.perf_counter()
     existing_state = _load_existing_export_state(
         export_dir=export_dir,
@@ -1089,13 +1106,18 @@ def evaluate_walkforward(
         fold_dir = export_dir / "folds" / fold.fold_id if export_dir is not None else None
         existing_summary = existing_state["summary_by_fold"].get(fold.fold_id)
         existing_manifest = existing_state["manifest_by_fold"].get(fold.fold_id)
+        data_hash = _dataset_hash(dataset.iloc[fold.train_start:fold.trade_end]) if fold_dir is not None else ""
+        existing_predictions = None
         if (
             existing_state["enabled"]
             and existing_summary is not None
             and existing_manifest is not None
             and fold_dir is not None
-            and _can_reuse_exported_fold(fold_dir, fold_record, configuration_hash)
+            and _can_reuse_exported_fold(fold_dir, fold_record, configuration_hash, data_hash)
         ):
+            existing_predictions = _load_existing_predictions(fold_dir)
+
+        if existing_predictions is not None:
             summary_records.append(existing_summary)
             research_manifest_records.append(
                 {
@@ -1114,9 +1136,7 @@ def evaluate_walkforward(
                 }
             )
 
-            existing_predictions = _load_existing_predictions(fold_dir)
-            if existing_predictions is not None:
-                oos_predictions.append(existing_predictions)
+            oos_predictions.append(existing_predictions)
 
             reused_folds += 1
             if enable_progress and should_log_progress(fold_index, total_folds, fold_progress_every):
@@ -1172,11 +1192,19 @@ def evaluate_walkforward(
         if export_dir is not None:
             ensure_dir(fold_dir)
 
-            onnx_contract = export_onnx_model(
+            sample_df = None
+            if validate_onnx:
+                validation_rows = int(cfg["export"].get("validate_rows", 32))
+                if validation_rows < 1:
+                    raise ValueError("export.validate_rows deve ser maior que zero")
+                sample_df = trade_df.iloc[:validation_rows]
+            onnx_contract, validation_payload = export_regime_onnx(
                 model=model,
-                feature_count=len(feature_columns),
                 output_path=fold_dir / "model.onnx",
                 opset=int(cfg["export"]["onnx_opset"]),
+                feature_columns=feature_columns,
+                sample_df=sample_df,
+                history_df=trade_history_df,
             )
             export_market_runtime_contract(
                 destination=fold_dir / "runtime_contract.csv",
@@ -1184,19 +1212,6 @@ def evaluate_walkforward(
                 feature_columns=feature_columns,
                 onnx_contract=onnx_contract,
             )
-
-            validation_rows = int(cfg["export"].get("validate_rows", 32))
-            validation_payload = {"status": "disabled"}
-            if validate_onnx:
-                sample_source = trade_df if not trade_df.empty else validation_df
-                sample_history_df = trade_history_df if not trade_df.empty else validation_history_df
-                validation_payload = validate_onnx_model(
-                    model=model,
-                    onnx_path=fold_dir / "model.onnx",
-                    sample_df=sample_source.iloc[:validation_rows].copy(),
-                    feature_columns=feature_columns,
-                    history_df=sample_history_df,
-                )
 
             confusion_df.to_csv(fold_dir / "confusion_matrix.csv")
             predictions_with_fold.to_csv(fold_dir / "trade_predictions.csv", index=False)
@@ -1225,6 +1240,7 @@ def evaluate_walkforward(
                 "purge_bars": int(policy.purge_bars),
                 "feature_schema_version": FEATURE_SCHEMA_VERSION,
                 "config_hash": configuration_hash,
+                "data_hash": data_hash,
                 "runtime_model_path": runtime_model_path,
                 "runtime_metadata_path": runtime_metadata_path,
                 "runtime_contract_path": runtime_contract_path,

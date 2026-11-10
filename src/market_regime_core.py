@@ -5,6 +5,7 @@ import json
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -33,9 +34,33 @@ MODEL_TYPE_ALIASES = {
 }
 
 
-def load_config(path: Path) -> Dict:
+def load_config(path: Path | None = None) -> Dict:
+    if path is None:
+        return {
+            "feature": {
+                "returns_lags": [1, 2, 3, 5, 10],
+                "atr_window": 14,
+                "vol_window": 20,
+                "ema_fast": 20,
+                "ema_slow": 50,
+            },
+            "label": {"horizon_bars": 8, "trend_threshold_atr": 1.5},
+            "train": {"model_type": "logistic_regression", "test_size": 0.20, "random_state": 42},
+            "walkforward": {
+                "train_window": 20000,
+                "trade_window": 2500,
+                "step_window": 2500,
+                "purge_bars": "auto",
+                "min_folds": 6,
+                "min_class_count_per_train": 100,
+            },
+            "export": {"onnx_opset": 17, "validate_rows": 32},
+        }
     with path.open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
+        config = yaml.safe_load(handle)
+    if not isinstance(config, dict):
+        raise ValueError(f"Configuracao deve ser um mapa YAML: {path}")
+    return config
 
 
 def ensure_dir(path: Path) -> None:
@@ -74,6 +99,14 @@ def build_feature_frame(candles: pd.DataFrame, cfg: Dict) -> Tuple[pd.DataFrame,
     horizon_bars = int(label_cfg["horizon_bars"])
     trend_threshold_atr = float(label_cfg["trend_threshold_atr"])
 
+    if not returns_lags or any(lag < 1 for lag in returns_lags) or len(set(returns_lags)) != len(returns_lags):
+        raise ValueError("feature.returns_lags deve conter defasagens positivas e distintas")
+    if atr_window < 1 or vol_window < 2 or ema_fast < 1:
+        raise ValueError("feature.atr_window e feature.ema_fast devem ser positivos e feature.vol_window deve ser >= 2")
+    if not np.isfinite(trend_threshold_atr) or trend_threshold_atr <= 0:
+        raise ValueError("label.trend_threshold_atr deve ser positivo e finito")
+    if horizon_bars < 1:
+        raise ValueError("label.horizon_bars deve ser maior que zero")
     if ema_fast >= ema_slow:
         raise ValueError("feature.ema_fast deve ser menor que feature.ema_slow")
 
@@ -116,6 +149,7 @@ def build_feature_frame(candles: pd.DataFrame, cfg: Dict) -> Tuple[pd.DataFrame,
     df["ema_spread"] = ema_fast_series / ema_slow_series - 1.0
 
     df["future_return"] = df["close"].shift(-horizon_bars) / df["close"] - 1.0
+    df["label_end_time"] = df.index.to_series().shift(-horizon_bars)
     df["future_move_atr"] = df["future_return"] / df["atr_norm"].replace(0.0, np.nan)
 
     df["regime_id"] = LABEL_TO_ID["range"]
@@ -149,17 +183,19 @@ def chronological_split(df: pd.DataFrame, test_size: float) -> Tuple[pd.DataFram
         raise ValueError("train.test_size deve ficar entre 0.05 e 0.50")
 
     test_rows = max(1, int(len(df) * test_size))
-    train = df.iloc[:-test_rows].copy()
     test = df.iloc[-test_rows:].copy()
+    train = df.iloc[:-test_rows]
+    if not test.empty:
+        train = train.loc[train["label_end_time"] < test.index[0]]
 
     if train.empty or test.empty:
-        raise ValueError("Split gerou treino ou teste vazio")
+        raise ValueError("Split gerou treino ou teste vazio apos a separacao temporal dos rotulos")
 
     ok, issues = validate_train_classes(train)
     if not ok:
         raise ValueError(" ".join(issues))
 
-    return train, test
+    return train.copy(), test
 
 
 def class_distribution(series: pd.Series) -> Dict[str, int]:
@@ -175,6 +211,7 @@ def dataset_diagnostics(candles: pd.DataFrame, dataset: pd.DataFrame, train_df: 
         "feature_rows": int(len(dataset)),
         "train_rows": int(len(train_df)),
         "test_rows": int(len(test_df)),
+        "purged_rows": int(len(dataset) - len(train_df) - len(test_df)),
         "candles_start": str(candles.index.min()) if len(candles) else None,
         "candles_end": str(candles.index.max()) if len(candles) else None,
         "train_class_distribution": class_distribution(train_df["regime_id"]),
@@ -1174,11 +1211,11 @@ def validate_onnx_model(
 ) -> Dict:
     try:
         import onnxruntime as ort
-    except ImportError:
-        ort = None
+    except ImportError as exc:
+        raise RuntimeError("Validacao ONNX requer onnxruntime") from exc
 
-    if ort is None:
-        return {"status": "skipped", "reason": "onnxruntime nao instalado"}
+    if sample_df.empty:
+        raise ValueError("A validacao ONNX requer pelo menos uma amostra")
 
     session = ort.InferenceSession(onnx_path.as_posix(), providers=["CPUExecutionProvider"])
     input_name = session.get_inputs()[0].name
@@ -1190,21 +1227,40 @@ def validate_onnx_model(
 
     probability_output = None
     for output in onnx_outputs:
-        if isinstance(output, np.ndarray) and output.ndim == 2 and output.shape[1] == len(LABEL_TO_ID):
+        if isinstance(output, np.ndarray) and output.shape == reference_proba.shape:
             probability_output = output.astype(np.float64)
             break
 
     if probability_output is None:
-        return {
-            "status": "warning",
-            "reason": "saida de probabilidade [N,3] nao encontrada no ONNX",
-            "output_names": output_names,
-        }
+        raise RuntimeError(f"Saida ONNX com formato {reference_proba.shape} nao encontrada: {output_names}")
 
     max_abs_diff = float(np.max(np.abs(probability_output - reference_proba)))
+    tolerance = 1e-4
+    if not np.isfinite(max_abs_diff) or max_abs_diff > tolerance:
+        raise RuntimeError(f"Paridade ONNX fora da tolerancia {tolerance:g}: erro maximo {max_abs_diff:g}")
     return {
         "status": "ok",
         "output_names": output_names,
         "rows_checked": int(len(sample_df)),
         "max_abs_diff_vs_reference": max_abs_diff,
+        "max_abs_diff_tolerance": tolerance,
     }
+
+
+def export_regime_onnx(
+    model: BaseRegimeModel,
+    output_path: Path,
+    opset: int,
+    feature_columns: Sequence[str],
+    sample_df: pd.DataFrame | None = None,
+    history_df: pd.DataFrame | None = None,
+) -> tuple[Dict, Dict]:
+    """Only replace an existing model after the new model passes requested validation."""
+    validation = {"status": "disabled"}
+    with TemporaryDirectory(dir=output_path.parent) as export_dir:
+        staged_model = Path(export_dir) / output_path.name
+        contract = export_onnx_model(model, len(feature_columns), staged_model, opset)
+        if sample_df is not None:
+            validation = validate_onnx_model(model, staged_model, sample_df, feature_columns, history_df)
+        staged_model.replace(output_path)
+    return contract, validation

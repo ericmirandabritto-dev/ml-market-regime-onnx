@@ -40,7 +40,7 @@ function Test-PythonDependencies {
     )
 
     try {
-        & $Exe -c "import numpy, pandas, sklearn, onnx, skl2onnx, onnxruntime" *>$null
+        & $Exe -c "import numpy, pandas, sklearn, yaml, onnx, skl2onnx, onnxruntime" *>$null
         return ($LASTEXITCODE -eq 0)
     }
     catch {
@@ -103,6 +103,9 @@ Opcoes:
     }
 }
 
+if ($PSBoundParameters.ContainsKey("InputFile") -and -not (Test-Path -LiteralPath $InputFile -PathType Leaf)) {
+    throw "Arquivo de entrada informado nao encontrado: $InputFile"
+}
 $resolvedInput = Resolve-InputFilePath -RequestedPath $InputFile
 if (-not $resolvedInput) {
     throw @"
@@ -127,7 +130,6 @@ $arguments = @(
     "src\train_market_regime_onnx.py",
     "--input", $resolvedInput,
     "--artifacts", $ArtifactsDir,
-    "--config", $ConfigFile,
     "--mode", $Mode
 )
 
@@ -181,4 +183,10 @@ Write-Host "Usando interpretador: $PythonExe"
 Write-Host "Modo: $Mode"
 Write-Host "Treinando com input: $resolvedInput"
 
+if ($PSBoundParameters.ContainsKey("ConfigFile") -or (Test-Path -LiteralPath $ConfigFile -PathType Leaf)) {
+    $arguments += @("--config", $ConfigFile)
+}
 & $PythonExe @arguments
+if ($LASTEXITCODE -ne 0) {
+    throw "O processo Python terminou com codigo $LASTEXITCODE"
+}

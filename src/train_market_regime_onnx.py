@@ -16,11 +16,10 @@ from market_regime_core import (
     ensure_dir,
     evaluate_model,
     export_market_runtime_contract,
-    export_onnx_model,
+    export_regime_onnx,
     load_candles_csv,
     load_config,
     save_json,
-    validate_onnx_model,
 )
 from walkforward import WalkForwardPolicy, evaluate_walkforward, resolve_purge_bars
 
@@ -60,12 +59,11 @@ def build_single_run_metadata(
 
 
 def train_single(args: argparse.Namespace) -> None:
-    config_path = Path(args.config)
     input_path = Path(args.input)
     artifacts_dir = Path(args.artifacts)
     ensure_dir(artifacts_dir)
 
-    cfg = load_config(config_path)
+    cfg = load_config(args.config)
     print("[train] stage=load_csv", flush=True)
     candles = load_candles_csv(input_path)
     print("[train] stage=build_features", flush=True)
@@ -79,7 +77,7 @@ def train_single(args: argparse.Namespace) -> None:
     model.fit(train_df, feature_columns)
 
     print("[train] stage=evaluate", flush=True)
-    test_history_df = train_df.tail(model.history_rows_needed).copy() if model.history_rows_needed > 0 else None
+    test_history_df = dataset.iloc[:-len(test_df)].tail(model.history_rows_needed)
     metrics, confusion_df, predictions_df = evaluate_model(
         model,
         test_df,
@@ -88,24 +86,20 @@ def train_single(args: argparse.Namespace) -> None:
     )
 
     print("[train] stage=export_onnx", flush=True)
-    onnx_contract = export_onnx_model(
+    sample_df = None
+    if args.validate_onnx:
+        validate_rows = int(cfg["export"].get("validate_rows", 32))
+        if validate_rows < 1:
+            raise ValueError("export.validate_rows deve ser maior que zero")
+        sample_df = test_df.iloc[:validate_rows]
+    onnx_contract, validation_payload = export_regime_onnx(
         model=model,
-        feature_count=len(feature_columns),
         output_path=artifacts_dir / "model.onnx",
         opset=int(cfg["export"]["onnx_opset"]),
+        feature_columns=feature_columns,
+        sample_df=sample_df,
+        history_df=test_history_df,
     )
-
-    validate_rows = int(cfg["export"].get("validate_rows", 32))
-    validation_payload = {"status": "disabled"}
-    if args.validate_onnx:
-        print("[train] stage=validate_onnx", flush=True)
-        validation_payload = validate_onnx_model(
-            model=model,
-            onnx_path=artifacts_dir / "model.onnx",
-            sample_df=test_df.iloc[:validate_rows].copy(),
-            feature_columns=feature_columns,
-            history_df=test_history_df,
-        )
 
     confusion_df.to_csv(artifacts_dir / "confusion_matrix.csv")
     predictions_df.reset_index().to_csv(artifacts_dir / "test_predictions.csv", index=False)
@@ -165,12 +159,11 @@ def walkforward_policy_from_args(cfg: Dict, args: argparse.Namespace) -> WalkFor
 
 
 def train_walkforward(args: argparse.Namespace) -> None:
-    config_path = Path(args.config)
     input_path = Path(args.input)
     artifacts_dir = Path(args.artifacts)
     ensure_dir(artifacts_dir)
 
-    cfg = load_config(config_path)
+    cfg = load_config(args.config)
     print("[train] stage=load_csv", flush=True)
     candles = load_candles_csv(input_path)
     print("[train] stage=build_features", flush=True)
@@ -236,12 +229,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train and export a market regime classifier to ONNX")
     parser.add_argument("--input", required=True, help="CSV com candles OHLCV")
     parser.add_argument("--artifacts", required=True, help="Diretorio de saida")
-    parser.add_argument("--config", required=True, help="Arquivo YAML de configuracao")
+    parser.add_argument("--config", type=Path, help="Arquivo YAML de configuracao (opcional)")
     parser.add_argument("--mode", choices=["single", "walkforward"], default="single", help="Modo de treino/exportacao")
     parser.add_argument(
         "--validate-onnx",
         action="store_true",
-        help="Compara a saida do ONNX com predict_proba do sklearn usando parte do conjunto de teste",
+        help="Exige paridade entre as probabilidades ONNX e as do modelo Python",
     )
 
     parser.add_argument("--train-window", type=int, default=None, help="Janela de treino walk-forward em barras")

@@ -1229,7 +1229,7 @@ def evaluate_holdout(cfg: Dict, candles: pd.DataFrame, dataset: pd.DataFrame, fe
     train_df, test_df = chronological_split(dataset, float(cfg["train"]["test_size"]))
     model = build_model_backend(cfg)
     model.fit(train_df, feature_columns)
-    test_history_df = train_df.tail(model.history_rows_needed).copy() if model.history_rows_needed > 0 else None
+    test_history_df = dataset.iloc[:-len(test_df)].tail(model.history_rows_needed)
     metrics, _confusion_df, _predictions_df = evaluate_model(
         model,
         test_df,
@@ -1708,7 +1708,7 @@ def run_family_budgeted_search(
                 evaluate_candidate(state, candidate)
 
 def run_sweep(args: argparse.Namespace) -> None:
-    base_cfg = load_config(Path(args.config))
+    base_cfg = load_config(args.config)
     candles = load_candles_csv(Path(args.input))
     evaluation_mode = str(args.evaluation_mode).lower()
     objective = str(args.objective)
@@ -1788,7 +1788,7 @@ def run_sweep(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Varre parametros de rotulo/modelo/janela para regime de mercado")
     parser.add_argument("--input", required=True, help="CSV com candles OHLCV")
-    parser.add_argument("--config", required=True, help="YAML base de configuracao")
+    parser.add_argument("--config", type=Path, help="YAML base de configuracao (opcional)")
     parser.add_argument("--output", default="reports/sweep_report.csv", help="CSV de saida")
     parser.add_argument("--evaluation-mode", choices=["walkforward", "holdout"], default="walkforward")
     parser.add_argument(
